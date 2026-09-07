@@ -459,12 +459,13 @@
       <ol>
         <li><a href="https://console.firebase.google.com" target="_blank" rel="noopener">console.firebase.google.com</a> 에서 구글 로그인 후 프로젝트를 하나 만듭니다. (Analytics는 꺼도 됩니다)</li>
         <li>왼쪽 메뉴 <b>빌드 → Realtime Database</b> → <b>데이터베이스 만들기</b>. 위치는 아무거나 골라도 됩니다.</li>
-        <li><b>규칙</b> 탭에서 내용을 아래로 바꾸고 게시합니다.
-          <code>{ "rules": { ".read": true, ".write": true } }</code>
-          <span class="warn-t">테스트 모드를 그대로 두면 30일 뒤 잠겨서 지도가 멈춥니다. 꼭 바꿔주세요.</span></li>
-        <li><b>데이터</b> 탭 맨 위에 보이는 주소를 복사해 아래에 붙여넣습니다.</li>
+        <li><b>규칙</b> 탭 내용을 아래로 바꾸고 게시합니다.
+          <code>{ "rules": { ".read": false, ".write": false, "trip": { ".read": "auth != null", "$c": { "$id": { ".write": "auth != null" } } } } }</code></li>
+        <li><b>Authentication → Sign-in method</b> 에서 <b>익명</b>을 사용 설정합니다.</li>
+        <li><b>데이터</b> 탭 주소와, <b>⚙ 프로젝트 설정 → 일반 → 웹 API 키</b>를 아래에 붙여넣습니다.</li>
       </ol>
       <input id="dbin" placeholder="https://프로젝트이름-default-rtdb.firebaseio.com" autocomplete="off" spellcheck="false">
+      <input id="dbkey" placeholder="웹 API 키 (AIza… )" autocomplete="off" spellcheck="false">
       <div class="setup-row">
         <button class="btn pri" id="dbgo">연결하기</button>
         <button class="btn gh" id="setupClose">닫기</button>
@@ -480,11 +481,13 @@
 'use strict';
 
 /* ─────────────────────────────────────────────────────────────
-   ▼▼▼  여기 한 줄만 고치면 됩니다  ▼▼▼
-   Firebase Realtime Database 주소를 따옴표 안에 붙여넣으세요.
-   (예시 주소 → https://my-trip-default-rtdb.firebaseio.com )
+   ▼▼▼  이 두 줄만 고치면 됩니다  ▼▼▼
+   1) Firebase Realtime Database 주소
+   2) Firebase 웹 API 키 (프로젝트 설정 → 일반 → 웹 API 키)
+      API 키는 원래 공개되는 값이라 저장소에 올라가도 괜찮습니다.
    ───────────────────────────────────────────────────────────── */
-var DB_URL = 'https://india-1df98-default-rtdb.asia-southeast1.firebasedatabase.app';
+var DB_URL  = 'https://india-1df98-default-rtdb.asia-southeast1.firebasedatabase.app';
+var API_KEY = 'AIzaSyAfnhxXVjqlR70xhBYsNcJIe-o5Kd5l7ys';
 /* ───────────────────────────────────────────────────────────── */
 
 /* ════ data ════ */
@@ -551,6 +554,49 @@ var DB = '';
 
 function lsGet(){ try{ return localStorage.getItem('india_db')||''; }catch(e){ return ''; } }
 function lsSet(v){ try{ localStorage.setItem('india_db', v); }catch(e){} }
+function lsGetK(){ try{ return localStorage.getItem('india_key')||''; }catch(e){ return ''; } }
+function lsSetK(v){ try{ localStorage.setItem('india_key', v); }catch(e){} }
+function lsGetR(){ try{ return localStorage.getItem('india_rt')||''; }catch(e){ return ''; } }
+function lsSetR(v){ try{ localStorage.setItem('india_rt', v); }catch(e){} }
+
+/* ── anonymous sign-in: nobody sees a login screen, but the
+      database rules can require auth != null ── */
+var AK = '', TOKEN = '', RT = '', authTimer = null;
+
+function schedRefresh(sec){
+  clearTimeout(authTimer);
+  authTimer = setTimeout(authRefresh, Math.max(60, (sec||3600) - 300) * 1000);
+}
+function authNew(){
+  return fetch('https://identitytoolkit.googleapis.com/v1/accounts:signUp?key='+encodeURIComponent(AK), {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({returnSecureToken:true})
+  }).then(function(r){ if(!r.ok) throw new Error('signup'); return r.json(); })
+    .then(function(j){
+      TOKEN = j.idToken; RT = j.refreshToken; lsSetR(RT);
+      schedRefresh(parseInt(j.expiresIn,10));
+      return true;
+    });
+}
+function authRefresh(){
+  if(!RT || !AK) return Promise.reject(new Error('no token'));
+  return fetch('https://securetoken.googleapis.com/v1/token?key='+encodeURIComponent(AK), {
+    method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
+    body:'grant_type=refresh_token&refresh_token='+encodeURIComponent(RT)
+  }).then(function(r){ if(!r.ok) throw new Error('refresh'); return r.json(); })
+    .then(function(j){
+      TOKEN = j.id_token; RT = j.refresh_token; lsSetR(RT);
+      schedRefresh(parseInt(j.expires_in,10));
+      restartStream();
+      return true;
+    });
+}
+function authStart(){
+  if(!AK){ TOKEN = ''; return Promise.resolve(false); }
+  RT = lsGetR();
+  return (RT ? authRefresh().catch(authNew) : authNew())
+    .catch(function(){ TOKEN = ''; return false; });
+}
 
 function normDb(u){
   u = (u||'').trim();
@@ -558,7 +604,12 @@ function normDb(u){
   if(!/^https?:\/\//i.test(u)) u = 'https://' + u;
   return u.replace(/\.json.*$/i, '').replace(/[/?#]+$/, '').replace(/\/+$/, '');
 }
-function dbUrl(path){ return DB + '/trip' + (path||'') + '.json'; }
+function dbUrl(path, extra){
+  var q = [];
+  if(TOKEN) q.push('auth=' + encodeURIComponent(TOKEN));
+  if(extra) q.push(extra);
+  return DB + '/trip' + (path||'') + '.json' + (q.length ? '?' + q.join('&') : '');
+}
 
 function shape(j){
   j = j || {};
@@ -573,7 +624,7 @@ function shape(j){
 
 function loadData(){
   if(!DB) return Promise.resolve(null);
-  return fetch(dbUrl() + '?t=' + Date.now(), {cache:'no-store'})
+  return fetch(dbUrl('', 't=' + Date.now()), {cache:'no-store'})
     .then(function(r){ if(!r.ok) throw new Error(r.status); return r.json(); })
     .then(shape);
 }
@@ -627,20 +678,25 @@ function pull(){
 }
 
 /* live updates when the browser supports it, polling otherwise */
-var polling = null;
-function startLive(){
-  if(polling) return;
-  polling = setInterval(function(){
-    if(document.visibilityState === 'visible') pull();
-  }, 10000);
-  if(!window.EventSource) return;
+var polling = null, stream = null;
+function restartStream(){
+  if(stream){ try{ stream.close(); }catch(e){} stream = null; }
+  if(!window.EventSource || !DB) return;
   try{
-    var es = new EventSource(dbUrl());
+    stream = new EventSource(dbUrl());
     var onEvt = function(){ pull(); };
-    es.addEventListener('put', onEvt);
-    es.addEventListener('patch', onEvt);
-    es.onerror = function(){ es.close(); };
+    stream.addEventListener('put', onEvt);
+    stream.addEventListener('patch', onEvt);
+    stream.onerror = function(){ try{ stream.close(); }catch(e){} stream = null; };
   }catch(e){}
+}
+function startLive(){
+  if(!polling){
+    polling = setInterval(function(){
+      if(document.visibilityState === 'visible') pull();
+    }, 10000);
+  }
+  restartStream();
 }
 
 function setSync(s){
@@ -1232,14 +1288,17 @@ function showSetup(on){
   document.getElementById('setup').style.display = on ? 'flex' : 'none';
 }
 
-function connect(url){
+function connect(url, key){
   var msg = document.getElementById('dbmsg');
   var u = normDb(url);
   if(!u){ msg.textContent = '주소를 입력해주세요.'; msg.className = 'dbmsg bad'; return; }
   msg.textContent = '확인 중…'; msg.className = 'dbmsg';
-  DB = u;
-  loadData().then(function(d){
-    lsSet(u);
+  DB = u; AK = (key||'').trim();
+  authStart().then(function(signed){
+    if(AK && !signed) throw new Error('auth');
+    return loadData();
+  }).then(function(d){
+    lsSet(u); lsSetK(AK);
     if(d) D = d;
     msg.textContent = '연결됐습니다.'; msg.className = 'dbmsg good';
     showSetup(false);
@@ -1248,13 +1307,15 @@ function connect(url){
     render(); setSync('ok'); startLive();
   }).catch(function(){
     DB = '';
-    msg.textContent = '연결하지 못했습니다. 주소와 Firebase 규칙을 다시 확인해주세요.';
+    msg.textContent = AK
+      ? '연결하지 못했습니다. API 키, 익명 로그인 사용 설정, 규칙을 확인해주세요.'
+      : '연결하지 못했습니다. 주소와 Firebase 규칙을 다시 확인해주세요.';
     msg.className = 'dbmsg bad';
   });
 }
 
 document.getElementById('dbgo').onclick = function(){
-  connect(document.getElementById('dbin').value);
+  connect(document.getElementById('dbin').value, document.getElementById('dbkey').value);
 };
 document.getElementById('dbin').onkeydown = function(e){
   if(e.key === 'Enter') connect(e.target.value);
@@ -1263,12 +1324,16 @@ document.getElementById('setupOpen').onclick = function(){ showSetup(true); };
 document.getElementById('setupClose').onclick = function(){ showSetup(false); };
 
 DB = normDb(DB_URL) || normDb(lsGet());
+AK = (API_KEY || lsGetK() || '').trim();
 
 setSync(DB ? 'sync' : 'setup');
 loadLeaflet().then(initMap).catch(function(){ mapOK = false; })
   .then(function(){
     if(!DB){ showSetup(true); render(); return; }
-    return pull().then(seedIfEmpty).then(function(){ render(); startLive(); });
+    return authStart()
+      .then(pull)
+      .then(seedIfEmpty)
+      .then(function(){ render(); startLive(); });
   });
 
 })();
